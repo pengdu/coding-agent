@@ -84,8 +84,6 @@ class Context:
         budget_tokens: int = DEFAULT_BUDGET_TOKENS,
         keep_recent: int = DEFAULT_KEEP_RECENT,
     ) -> None:
-        self.system_prompt = system_prompt
-        self.task = task
         self.budget_tokens = budget_tokens
         self.keep_recent = keep_recent
         self.messages: list[Message] = [
@@ -104,9 +102,6 @@ class Context:
         return self.tokens > self.budget_tokens
 
     # -- writes -----------------------------------------------------------
-
-    def add(self, role: str, content: str, **extra: Any) -> None:
-        self.messages.append({"role": role, "content": content, **extra})
 
     def add_assistant(self, text: str, tool_calls: list[dict] | None = None) -> None:
         msg: Message = {"role": "assistant", "content": text or ""}

@@ -32,10 +32,13 @@ from typing import Any, Callable
 from .context import Context
 from .provider import AssistantTurn, Provider, ToolCall
 from .prompts import SYSTEM_PROMPT
-from .tools import Tool, ToolDenied, ToolError, Workspace, tool_schemas
+from .tools import Tool, ToolDenied, ToolError, Workspace, build_tools, tool_schemas
 
 MAX_STEPS = 40
-MAX_TOOL_CALLS_PER_TURN = 1  # serialized turns: one action, then look again
+# One action per turn is what we *ask* for, via `parallel_tool_calls: false` in
+# the request body. It is not enforced: a model that batches anyway gets every
+# call answered, because a half-answered turn corrupts the transcript.
+MAX_TOOL_CALLS_PER_TURN = 1
 
 
 @dataclass
@@ -109,16 +112,11 @@ class Agent:
     ) -> None:
         self.provider = provider
         self.ws = workspace if isinstance(workspace, Workspace) else Workspace(workspace)
-        self.tools: dict[str, Tool] = self._build_tools()
+        self.tools: dict[str, Tool] = build_tools(self.ws)
         self.system_prompt = system_prompt
         self.max_steps = max_steps
         self.budget_tokens = budget_tokens
         self.keep_recent = keep_recent
-
-    def _build_tools(self) -> dict[str, Tool]:
-        from .tools import build_tools
-
-        return build_tools(self.ws)
 
     # -- dispatch ---------------------------------------------------------
 
@@ -180,7 +178,13 @@ class Agent:
                 break
 
             step = Step(index=i, text=turn.text)
-            for call in turn.tool_calls[:MAX_TOOL_CALLS_PER_TURN]:
+            # Answer every call the model made. A model may batch several in
+            # one turn even when we asked it not to; refusing to answer the
+            # surplus leaves an assistant message with tool_calls and no
+            # matching tool results, which is a malformed transcript and gets
+            # the *next* request rejected. So the cap is a target, not a
+            # limit -- the transcript's integrity outranks our preference.
+            for call in turn.tool_calls:
                 output, is_error = self.dispatch(call)
                 result.tool_calls_made += 1
                 if is_error:
@@ -191,18 +195,35 @@ class Agent:
                 ctx.add_tool_result(call.id, call.name, output)
                 flag = "x" if is_error else "."
                 emit(f"  [{flag}] {call.name}({_preview(call.arguments)}) -> {_headline(output)}")
+            if len(turn.tool_calls) > MAX_TOOL_CALLS_PER_TURN:
+                emit(
+                    f"  ~ model batched {len(turn.tool_calls)} calls in one turn; "
+                    f"all answered to keep the transcript valid"
+                )
             result.steps.append(step)
 
             if ctx.compact():
                 result.compactions = ctx.compactions
                 emit(f"  ~ context compacted ({ctx.tokens} tokens, step {i})")
         else:
-            result.final_text = ctx.messages[-1].get("content", "")
+            result.final_text = _last_assistant_text(ctx.messages)
             result.stop_reason = f"step limit reached ({self.max_steps} steps)"
 
         result.compactions = ctx.compactions
         result.elapsed = time.monotonic() - started
         return result
+
+
+def _last_assistant_text(messages: list[dict[str, Any]]) -> str:
+    """The model's own last words, not whatever tool output followed them.
+
+    On a step-limit exit the last message is normally a tool result, so
+    reading `messages[-1]` would report a command's stdout as the answer.
+    """
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            return str(m.get("content") or "")
+    return ""
 
 
 def first(text: str, n: int) -> str:

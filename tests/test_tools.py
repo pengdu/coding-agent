@@ -12,7 +12,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent.tools import ToolDenied, ToolError, Workspace, build_tools  # noqa: E402
+from agent.tools import MAX_GREP_LINES, ToolDenied, ToolError, Workspace, build_tools  # noqa: E402
 
 
 class ToolTestCase(unittest.TestCase):
@@ -61,6 +61,23 @@ class TestReadFile(ToolTestCase):
         with self.assertRaises(ToolError) as ctx:
             self.call("read_file", path="pkg")
         self.assertIn("use list_dir", str(ctx.exception).lower())
+
+    def test_paging_arguments_are_range_checked(self):
+        # Off-by-one and zero values arrive from models regularly, and a
+        # confusing slice is worse than a refusal.
+        self.write("a.txt", "one\ntwo\n")
+        cases = {
+            "1-based": {"offset": 0},
+            ">= 1": {"limit": 0},
+            "past the end": {"offset": 99},
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(rejected=label), self.assertRaises(ToolError):
+                self.call("read_file", path="a.txt", **kwargs)
+
+    def test_an_empty_file_says_so_instead_of_looking_truncated(self):
+        self.write("empty.txt", "")
+        self.assertIn("0 lines", self.call("read_file", path="empty.txt"))
 
 
 class TestEditFile(ToolTestCase):
@@ -126,6 +143,12 @@ class TestWriteAndList(ToolTestCase):
         out = self.call("write_file", path="pkg/deep/new.py", content="c\n")
         self.assertIn("overwrote", out)
 
+    def test_line_count_is_right_when_content_has_no_trailing_newline(self):
+        # "a\nb" is 2 lines, not 3 -- and off-by-one here misleads the model
+        # about what it just wrote.
+        out = self.call("write_file", path="nonl.py", content="a\nb")
+        self.assertIn("2 lines", out)
+
     def test_list_dir_distinguishes_dirs_from_files(self):
         self.write("z.txt", "x")
         self.write("sub/y.txt", "x")
@@ -133,6 +156,21 @@ class TestWriteAndList(ToolTestCase):
         self.assertIn("sub/", out)
         self.assertIn("z.txt", out)
         self.assertIn("bytes", out)
+
+    def test_list_dir_on_the_root_uses_a_readable_prefix(self):
+        self.write("z.txt", "x")
+        # relpath would be '' here; a bare "/ contains" reads like a typo.
+        self.assertTrue(self.call("list_dir", path=".").startswith("./ contains"))
+
+    def test_list_dir_reports_an_empty_directory(self):
+        os.makedirs(os.path.join(self.ws.root, "empty"))
+        self.assertIn("is empty", self.call("list_dir", path="empty"))
+
+    def test_list_dir_on_a_file_points_at_read_file(self):
+        self.write("z.txt", "x")
+        with self.assertRaises(ToolError) as ctx:
+            self.call("list_dir", path="z.txt")
+        self.assertIn("read_file", str(ctx.exception))
 
 
 class TestGrep(ToolTestCase):
@@ -156,6 +194,49 @@ class TestGrep(ToolTestCase):
     def test_regex_opt_in(self):
         self.write("a.py", "value = 42\n")
         self.assertIn("a.py:1", self.call("grep", pattern=r"value = \d+", is_regex=True))
+
+    def test_a_malformed_regex_is_advice_not_a_traceback(self):
+        # An unparseable pattern is the model's mistake, so it must come back
+        # as a fixable instruction. Leaking a stdlib traceback instead also
+        # leaks the host's absolute Python paths into the model's context,
+        # which is exactly what gets sent to a remote API.
+        self.write("a.py", "value = 42\n")
+        with self.assertRaises(ToolError) as ctx:
+            self.call("grep", pattern="[unclosed", is_regex=True)
+        msg = str(ctx.exception)
+        self.assertIn("not a valid regex", msg)
+        self.assertIn("is_regex=false", msg, "must name the way out")
+        for leak in ("Traceback", "/usr/lib", "site-packages", "_parser.py"):
+            self.assertNotIn(leak, msg, f"error text leaked internals: {leak}")
+
+    def test_a_malformed_regex_is_still_fine_as_a_literal(self):
+        self.write("a.py", "value[unclosed = 1\n")
+        self.assertIn("a.py:1", self.call("grep", pattern="value[unclosed"))
+
+    def test_empty_pattern_is_rejected(self):
+        with self.assertRaises(ToolError):
+            self.call("grep", pattern="")
+
+    def test_missing_path_is_rejected(self):
+        with self.assertRaises(ToolError):
+            self.call("grep", pattern="x", path="nope")
+
+    def test_unreadable_file_does_not_abort_the_whole_search(self):
+        # A broken symlink makes getsize raise; one bad file must not take
+        # the results of every other file down with it.
+        self.write("a.py", "needle\n")
+        os.symlink(os.path.join(self.ws.root, "does-not-exist"), os.path.join(self.ws.root, "dangling"))
+        self.assertIn("a.py:1", self.call("grep", pattern="needle"))
+
+    def test_the_match_cap_is_exact_and_says_it_was_hit(self):
+        # The cap is a contract with the model's context budget: it must never
+        # overshoot, and it must not truncate silently.
+        for i in range(6):
+            self.write(f"f{i}.txt", "needle\n" * (MAX_GREP_LINES // 2))
+        out = self.call("grep", pattern="needle")
+        hits = [ln for ln in out.splitlines() if "needle" in ln]
+        self.assertEqual(len(hits), MAX_GREP_LINES)
+        self.assertIn("stopped at", out)
 
     def test_skips_vcs_and_build_noise(self):
         self.write(".git/config", "needle\n")

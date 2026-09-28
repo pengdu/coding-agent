@@ -1,12 +1,13 @@
 # coding-agent
 
-一个能跑的最小 coding agent。约 400 行实现 + 90 个测试，零第三方依赖（纯标准库）。
+一个能跑的最小 coding agent。`agent/` 约 1500 行实现 + 169 个测试，零第三方依赖（纯标准库）。
 
 存在的目的不是"最强"，而是把一个 agent 里**真正会出 bug 的地方**摊开让你看清楚：
 工具的错误消息、上下文的压缩接缝、循环的失败路径。这三样比模型选型重要得多。
 
 ```
 agent/
+  config.py     用 JSON 描述有哪些 model/provider（profile）
   provider.py   怎么跟模型说话（MockProvider / OpenAIProvider）
   tools.py      模型能做什么（6 个工具 + 工作区隔离）
   context.py    模型能看到什么，以及怎么忘（压缩）
@@ -14,8 +15,9 @@ agent/
   prompts.py    system prompt
 demo.py         剧本化的假模型，用来跑通全流程
 demo_workspace/ demo 的靶子（一个故意坏掉的小项目）
+.agent.json     model/provider 配置文件（不含 key）
 main.py         CLI
-tests/          94 个测试
+tests/          169 个测试
 ```
 
 ## 跑起来
@@ -27,8 +29,8 @@ python3 main.py --demo
 # 2. 跑测试
 python3 -m unittest discover -s tests -t .
 
-# 3. 接真实模型
-export OPENAI_API_KEY=sk-...
+# 3. 接真实模型（key 从环境变量读，不要写进命令行）
+export DEEPSEEK_API_KEY=sk-...     # 导出即可，.agent.json 里的 profile 会自动认出来
 python3 main.py --workspace ~/some/repo "把 utils 里的 fetch 加上重试"
 ```
 
@@ -37,18 +39,71 @@ python3 main.py --workspace ~/some/repo "把 utils 里的 fetch 加上重试"
 
 ## 接不同模型
 
-`OpenAIProvider` 走的是 OpenAI chat/completions 协议，所以任何兼容的服务都能用：
+`OpenAIProvider` 走的是 OpenAI chat/completions 协议，所以任何兼容的服务都能用。
+endpoint、model、key 放在哪，三样都写在 JSON 配置文件里（`.agent.json`）：
+
+```json
+{
+  "default": "deepseek",
+  "profiles": {
+    "deepseek": {
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-chat",
+      "api_key_env": "DEEPSEEK_API_KEY"
+    },
+    "local": {
+      "base_url": "http://localhost:8000/v1",
+      "model": "qwen-max",
+      "api_key_env": null
+    }
+  }
+}
+```
+
+**key 不写进这个文件**，profile 只写「去哪个环境变量读」。这个文件是要提交的，
+key 写进去就是等到有人 push 之后才暴露的泄漏。`api_key_env: null` 表示这个 endpoint
+不要认证（本地 vLLM 的常见情况），此时连 `Authorization` 头都不会发。
 
 ```bash
-# DeepSeek
-python3 main.py --base-url https://api.deepseek.com/v1 --model deepseek-chat "..."
+export DEEPSEEK_API_KEY=sk-...
+python3 main.py --workspace ~/some/repo "..."              # 用 default
 
-# 硅基流动 / 月之暗面 / OpenRouter / 本地 vLLM ... 同理，换 base-url 和 model
-export OPENAI_BASE_URL=...
-export OPENAI_MODEL=...
-export OPENAI_API_KEY=...
-python3 main.py "..."
+python3 main.py --list-profiles                           # 有哪些 profile、key 齐不齐
+python3 main.py --profile local --workspace ~/some/repo "..."
 ```
+
+`--config` 可以指定别的文件；不给就在当前目录和各级父目录里找 `.agent.json` /
+`agent.json`，都没有就用内置的 `openai` + `deepseek` 两套。导了哪个 key 就自动选
+对应的 profile，所以多数时候一个 flag 都不用给。
+
+换模型只改 `--model`，base url 留在 profile 里：
+
+```bash
+python3 main.py --model deepseek-reasoner "..."           # 换模型
+```
+
+配置写错了会直接告诉你哪个 profile 的哪个字段不对，然后 `exit 2`——不会等到发请求
+才变成一个 401：
+
+```
+$ python3 main.py --config broken.json "..."
+config problem: broken.json: profile 'p' has unknown field(s) ['base_uri'].
+Known: ['base_url', 'model', 'api_key_env', 'timeout']
+```
+
+profile 只管 endpoint。`max_steps`、`budget_tokens`、workspace 仍然是命令行 flag，
+这样每个设置只有一个地方，不会出现「两处都写了，听谁的」。
+
+两个实测过的坑，DeepSeek 上都能碰到：
+
+- **模型会无视 `parallel_tool_calls: false`，一轮吐多个 tool call。** 循环不丢任何一个
+  （丢一个就会留下一条有 `tool_calls` 却没有 tool 结果的 assistant 消息，provider 直接
+  400 拒掉整个请求），所以那个常量是"请求"而不是"限制"。
+- **输出被 `max_tokens` 截断时（`finish_reason: length`），模型以为自己说完了。**
+  循环会在文本后面追加一句说明，否则 agent 看起来只是"话少"。
+
+`deepseek-reasoner` 走 tool call 时 `content` 是空串，只有 `reasoning_content`——
+provider 主动丢掉后者（回传会报错），所以它的每一步文字输出都是空的，属正常。
 
 要接 Anthropic 这类原生协议，写一个 adapter 就行——内部统一用 OpenAI 格式，
 所以只是两个纯函数：`to_native(messages, tools)` 和 `from_native(response)`。
@@ -73,8 +128,11 @@ while 还有步数:
    错误恢复机制——再往后是模型该报告的问题，不是循环该粉饰的。
 3. **步数和工具调用数有硬上限**，所以模型转晕了不会把你的钱烧光。
 
-一次只允许一个工具调用（`MAX_TOOL_CALLS_PER_TURN`）。串行看起来慢，但让"看到
-结果再决定下一步"成为可能，而这是 agent 区别于脚本的地方。
+串行：请求里带 `parallel_tool_calls: false`，一次只要一个工具调用。串行看起来慢，
+但让"看到结果再决定下一步"成为可能，而这是 agent 区别于脚本的地方。
+
+模型不一定会听话。真遇上批量调用，循环会把每一个都执行掉——不是纵容，是必须：
+只回灌一部分会让对话记录本身变成非法格式。
 
 ## 几个刻意的设计决定
 
@@ -125,8 +183,11 @@ Here is the whole file (2 lines). Copy from it exactly, including indentation:
 
 | 变量 | 说明 |
 |---|---|
-| `OPENAI_API_KEY` | 必填（除非用 `--demo`） |
-| `OPENAI_BASE_URL` | 默认 `https://api.openai.com/v1` |
-| `OPENAI_MODEL` | 默认 `gpt-4o-mini` |
+| `DEEPSEEK_API_KEY` | 内置 profile 用；导了就自动选 deepseek |
+| `OPENAI_API_KEY` | 内置 profile 用；导了就自动选 openai |
 
-CLI 里的 `--base-url` / `--model` 优先级更高。
+自己写 profile 的话，变量名由 `api_key_env` 决定，可以是任意名字。
+
+优先级：`--model/--base-url` > profile > key 推断。`--demo` 不需要任何 key。
+
+key 只从环境变量读——命令行参数会进 shell history 和 `ps` 输出，配置文件会进 git。

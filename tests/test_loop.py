@@ -50,26 +50,36 @@ class LoopTestCase(unittest.TestCase):
         return Agent(provider=provider, workspace=self.ws, **kw)
 
 
-class TestScriptedDemo(LoopTestCase):
-    """End to end. Fails if any guarantee in the loop regresses."""
+class TestScriptedDemo(unittest.TestCase):
+    """End to end. Fails if any guarantee in the loop regresses.
 
-    def setUp(self):
-        super().setUp()
-        self.proj = self.fixture_workspace()
-        self.provider = build_script()
-        self.events = []
-        self.run = Agent(provider=self.provider, workspace=self.proj).run(
-            TASK, on_event=self.events.append
+    All nine tests below assert on properties of *one* run, so the run happens
+    once per class. Per-test setup meant paying the whole 9-turn agent for
+    every assertion, with no extra coverage -- a General Fixture whose only
+    effect was to make the suite slow.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmp.cleanup)
+        # A copy of the fixture, so the demo never mutates the shared one.
+        cls.proj = os.path.join(tmp.name, "proj")
+        shutil.copytree(FIXTURE, cls.proj)
+        cls.provider = build_script()
+        cls.events = []
+        cls.demo_run = Agent(provider=cls.provider, workspace=cls.proj).run(
+            TASK, on_event=cls.events.append
         )
 
     def test_completes_normally(self):
-        self.assertEqual(self.run.stop_reason, "done")
-        self.assertTrue(self.run.ok)
-        self.assertEqual(self.run.turns_used, 9)
+        self.assertEqual(self.demo_run.stop_reason, "done")
+        self.assertTrue(self.demo_run.ok)
+        self.assertEqual(self.demo_run.turns_used, 9)
 
     def test_the_deliberate_bad_edit_produced_exactly_one_error(self):
-        self.assertEqual(self.run.tool_errors, 1)
-        self.assertEqual(self.run.tool_calls_made, 8)
+        self.assertEqual(self.demo_run.tool_errors, 1)
+        self.assertEqual(self.demo_run.tool_calls_made, 8)
 
     def test_the_file_was_actually_changed(self):
         with open(os.path.join(self.proj, "utils.py")) as fh:
@@ -85,7 +95,7 @@ class TestScriptedDemo(LoopTestCase):
         self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
 
     def test_final_message_reports_verification(self):
-        lowered = self.run.final_text.lower()
+        lowered = self.demo_run.final_text.lower()
         self.assertIn("retry_call", lowered)
         self.assertIn("verified", lowered)
 
@@ -183,6 +193,28 @@ class TestFailureModes(LoopTestCase):
         self.assertIn("connection reset by peer", result.stop_reason)
         self.assertIn("Traceback", result.trace)
 
+    def test_batched_tool_calls_are_all_answered(self):
+        # Real models batch calls even when asked not to. Answering only the
+        # first leaves the assistant message carrying two tool_calls with one
+        # tool result, and the provider rejects the next request -- which is
+        # how this was found, against a live API. Every id must be answered.
+        provider = MockProvider(
+            [
+                turn(
+                    "two at once",
+                    [call("list_dir", {"path": "."}, 1), call("list_dir", {"path": "."}, 2)],
+                ),
+                turn("done"),
+            ]
+        )
+        r = self.agent(provider).run("t")
+        self.assertTrue(r.ok, r.stop_reason)
+        self.assertEqual(r.tool_calls_made, 2)
+        asked = [c["id"] for m in provider.calls[1]["messages"] if m["role"] == "assistant"
+                 for c in m["tool_calls"]]
+        answered = [m["tool_call_id"] for m in provider.calls[1]["messages"] if m["role"] == "tool"]
+        self.assertEqual(sorted(asked), sorted(answered), "every tool_call needs a tool result")
+
     def test_step_limit_stops_a_looping_model(self):
         provider = MockProvider(
             [turn("again", [call("list_dir", {"path": "."}, i)]) for i in range(1, 30)]
@@ -192,6 +224,19 @@ class TestFailureModes(LoopTestCase):
         self.assertIn("step limit reached (3 steps)", result.stop_reason)
         self.assertEqual(result.turns_used, 3)
         self.assertEqual(result.tool_calls_made, 3)
+
+    def test_step_limit_reports_the_models_words_not_a_tool_result(self):
+        # On this exit path the last message in the context is a tool result,
+        # so reporting `messages[-1]` would hand the user a directory listing
+        # and call it the agent's answer.
+        with open(os.path.join(self.ws.root, "m.txt"), "w") as fh:
+            fh.write("contents\n")
+        provider = MockProvider(
+            [turn("I am still thinking", [call("read_file", {"path": "m.txt"}, i)]) for i in range(1, 6)]
+        )
+        result = self.agent(provider, max_steps=3).run("t")
+        self.assertEqual(result.final_text, "I am still thinking")
+        self.assertNotIn("contents", result.final_text)
 
     def test_exhausted_mock_is_an_error_not_a_silent_success(self):
         # Two scripted turns, both asking for another tool. The loop asks for
@@ -261,18 +306,10 @@ class TestTranscript(LoopTestCase):
         self.assertEqual(result.final_text, "all done, nothing more to do")
         self.assertEqual(result.tool_calls_made, 0)
 
-    def test_one_call_per_turn_is_enforced(self):
-        provider = MockProvider(
-            [
-                turn("two at once", [
-                    call("list_dir", {"path": "."}, 1),
-                    call("list_dir", {"path": "."}, 2),
-                ]),
-                turn("done"),
-            ]
-        )
-        result = self.agent(provider).run("t")
-        self.assertEqual(result.tool_calls_made, 1)
+    def test_every_tool_is_advertised_to_the_model(self):
+        result = self.agent(MockProvider([turn("done")])).run("t")
+        self.assertTrue(result.ok)
+        self.assertEqual(len(self.agent(MockProvider([])).tools), 6)
 
     def test_compaction_runs_during_a_real_session(self):
         provider = MockProvider(

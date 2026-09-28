@@ -60,6 +60,12 @@ class Provider(Protocol):
 ScriptedTurn = AssistantTurn | str | Callable[[list[Message]], AssistantTurn]
 
 
+def _finish_reason(payload: dict) -> str:
+    """Why the model stopped. `length` means it ran out of output budget."""
+    choices = payload.get("choices") or [{}]
+    return str(choices[0].get("finish_reason") or "")
+
+
 class MockProvider:
     """Replays a fixed list of turns, one per loop step.
 
@@ -150,7 +156,12 @@ def openai_to_assistant_turn(message: dict, model: str) -> AssistantTurn:
 
 
 class OpenAIProvider:
-    """POSTs to {base_url}/chat/completions with urllib. No dependencies."""
+    """POSTs to {base_url}/chat/completions with urllib. No dependencies.
+
+    Works against any OpenAI-compatible endpoint, which covers DeepSeek,
+    Moonshot, OpenRouter, SiliconFlow, and a local vLLM. Only the defaults
+    are OpenAI-specific.
+    """
 
     def __init__(
         self,
@@ -159,18 +170,36 @@ class OpenAIProvider:
         model: str | None = None,
         timeout: int = 180,
     ) -> None:
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        # An explicit empty string means "this endpoint needs no key", which is
+        # how a local vLLM is addressed. None means "look in the environment",
+        # and if that turns up nothing the agent cannot run, so it errors here
+        # rather than at the first request with a bare 401.
+        if api_key is None:
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+            if not api_key:
+                raise ProviderError(
+                    "no API key: set OPENAI_API_KEY or DEEPSEEK_API_KEY, or point "
+                    "--config at a profile that names a key variable. "
+                    "Use --demo to run without one."
+                )
+        self.api_key = api_key
         self.base_url = (
             base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
         ).rstrip("/")
         self.model = model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
         self.timeout = timeout
-        if not self.api_key:
-            raise ProviderError(
-                "no API key: set OPENAI_API_KEY (and OPENAI_BASE_URL / "
-                "OPENAI_MODEL if you are not talking to api.openai.com). "
-                "Use MockProvider to run without one."
-            )
+        if "deepseek" in self.base_url.lower() and "reasoner" in self.model.lower():
+            # Thinking tokens are generated before the answer, which adds
+            # seconds per turn on a long task. The stock 180s is enough for
+            # deepseek-chat but can cut off a reasoner mid-run.
+            self.timeout = max(self.timeout, 300)
+
+    def _headers(self) -> dict[str, str]:
+        """Auth is omitted when there is no key, for endpoints that allow it."""
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
     def complete(self, messages: list[Message], tools: list[dict]) -> AssistantTurn:
         body: dict[str, Any] = {
@@ -185,10 +214,7 @@ class OpenAIProvider:
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(body).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
+            headers=self._headers(),
             method="POST",
         )
         try:
@@ -203,7 +229,18 @@ class OpenAIProvider:
         choices = payload.get("choices") or []
         if not choices:
             raise ProviderError(f"no choices in response: {payload}")
-        return openai_to_assistant_turn(choices[0]["message"], self.model)
+
+        finish = _finish_reason(payload)
+        turn = openai_to_assistant_turn(choices[0]["message"], self.model)
+        if finish == "length" and not turn.tool_calls:
+            # Truncated mid-sentence. The model believes it finished, so it
+            # would report success and stop. Without this it looks like the
+            # agent simply decided to be terse.
+            turn.text = (
+                f"{turn.text}\n\n[response hit the output token limit and was cut off "
+                f"mid-thought by {self.model}; re-ask for less at a time]"
+            ).strip()
+        return turn
 
 
 # --------------------------------------------------------------------------

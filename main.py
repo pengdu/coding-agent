@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """CLI entry point.
 
-    python3 main.py "add a retry helper"       # needs OPENAI_API_KEY
+    python3 main.py "add a retry helper"       # needs an API key
     python3 main.py --demo                     # scripted model, no key
+    python3 main.py --profile local "..."      # a profile from .agent.json
     python3 main.py --workspace ~/some/repo "..." --max-steps 60
+
+Which model to talk to comes from a JSON config file (.agent.json), which
+lists named profiles -- an endpoint, a model, and the *name* of the
+environment variable holding the key. Keys are never stored in that file,
+because it is meant to be committed. `python3 main.py --list-profiles`
+shows what is available.
 """
 
 from __future__ import annotations
@@ -13,25 +20,98 @@ import os
 import shutil
 import sys
 
-from agent import Agent, MockProvider, OpenAIProvider, Workspace
+from agent import Agent, OpenAIProvider, Workspace
+from agent.config import CONFIG_FILENAMES, Config, ConfigError, load_config_or_builtin
 from demo import TASK, build_script
 
 
-def main(argv: list[str] | None = None) -> int:
+def resolve_provider(args: argparse.Namespace, config: Config | None = None) -> OpenAIProvider:
+    """Build the provider from a profile, letting explicit flags win.
+
+    Two layers, each overriding the one below: command-line flags, then the
+    chosen profile. The profile comes from --profile, or is inferred from
+    whichever key is actually exported, so the common case needs no flag.
+    """
+    config = config if config is not None else load_config_or_builtin(args.config)
+    profile = config.get(args.profile) if args.profile else config.infer()
+
+    if not profile.api_key() and profile.api_key_env:
+        raise SystemExit(
+            f"profile '{profile.name}' needs {profile.api_key_env}, which is not set.\n"
+            f"  export {profile.api_key_env}=...      or      --profile {_other(config, profile)}"
+        )
+
+    return OpenAIProvider(
+        # Not `or None`: None means "fall back to the environment", and that
+        # would turn a deliberately keyless local endpoint back into a 401.
+        api_key=profile.api_key(),
+        base_url=args.base_url or profile.base_url,
+        model=args.model or profile.model,
+        timeout=profile.timeout or 180,
+    )
+
+
+def _other(config: Config, current: "object") -> str:
+    """A profile name worth suggesting instead of the one that has no key."""
+    for name in config.names():
+        if name != getattr(current, "name", None):
+            return name
+    return config.default
+
+
+def _list_profiles(config: Config) -> int:
+    print(f"config: {config.source}")
+    for name in config.names():
+        profile = config.profiles[name]
+        marker = " (default)" if name == config.default else ""
+        print(f"  {name}{marker}")
+        print(f"      {profile.describe()}")
+    if not config.names():
+        print("  (none)")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI's flags, in one place so tests can parse without running."""
     p = argparse.ArgumentParser(prog="coding-agent", description="A small coding agent.")
     p.add_argument("task", nargs="?", help="what you want done")
     p.add_argument("--demo", action="store_true", help="run the scripted demo, no API key needed")
+    p.add_argument("--config", metavar="FILE",
+                   help="JSON file of model profiles (default: look for "
+                        f"{' or '.join(CONFIG_FILENAMES)} in this directory and upwards)")
+    p.add_argument("--profile", metavar="NAME",
+                   help="which profile to use (default: the one whose key is exported)")
+    p.add_argument("--list-profiles", action="store_true",
+                   help="print the profiles this config defines, then exit")
     p.add_argument("--workspace", "-w", default=None,
                    help="directory the agent may touch (default: cwd, or demo_workspace for --demo)")
     p.add_argument("--max-steps", type=int, default=40, help="hard cap on model turns")
     p.add_argument("--budget-tokens", type=int, default=60_000, help="context budget before compaction")
-    p.add_argument("--model", help="model id, e.g. gpt-4o, deepseek-chat, qwen-max")
-    p.add_argument("--base-url", help="OpenAI-compatible base url, e.g. https://api.deepseek.com/v1")
+    p.add_argument("--model", help="model id, overriding the profile's")
+    p.add_argument("--base-url", help="base url, overriding the profile's")
     p.add_argument("--quiet", "-q", action="store_true", help="only print the final answer")
-    args = p.parse_args(argv)
+    return p
 
-    if not args.demo and not args.task:
-        p.error("give a task, or pass --demo")
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if not args.list_profiles and not args.demo and not args.task:
+        # Checked before touching the config: a user who forgot the task should
+        # be told that, not told their API key is missing.
+        build_parser().error("give a task, or pass --demo")
+
+    try:
+        if args.list_profiles:
+            return _list_profiles(load_config_or_builtin(args.config))
+
+        provider = build_script() if args.demo else resolve_provider(args)
+    except ConfigError as exc:
+        # The config is hand-written, so its errors are the user's to fix, not
+        # a crash. A traceback here would bury the one line that says what to
+        # change, behind six frames of library internals.
+        print(f"config problem: {exc}", file=sys.stderr)
+        return 2
 
     if args.workspace:
         workspace = args.workspace
@@ -47,11 +127,6 @@ def main(argv: list[str] | None = None) -> int:
         workspace = "."
 
     task = TASK if args.demo else args.task
-    provider = build_script() if args.demo else OpenAIProvider(
-        api_key=os.environ.get("OPENAI_API_KEY"),
-        base_url=args.base_url,
-        model=args.model,
-    )
 
     ws = Workspace(workspace)
     agent = Agent(
@@ -62,6 +137,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print(f"workspace: {ws.root}")
+    if not args.demo:
+        print(f"model: {provider.model} @ {provider.base_url}")
     print(f"task: {task}\n")
 
     result = agent.run(task, on_event=(lambda m: None) if args.quiet else print)

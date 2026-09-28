@@ -26,6 +26,15 @@ MAX_OUTPUT_CHARS = 8000
 MAX_GREP_LINES = 200
 COMMAND_TIMEOUT = 180
 
+MAX_LIST_ENTRIES = 300  # entries shown by list_dir before it says "... more"
+MAX_GREP_FILE_BYTES = 2_000_000  # grep skips anything bigger, and says so
+MAX_MATCH_CHARS = 300  # a single grep hit is truncated to this
+MAX_SHOWN_MATCHES = 10  # ambiguous-edit error shows at most this many lines
+MAX_NEAR_MATCHES = 20  # large-file edit hint shows at most this many lines
+SMALL_FILE_LINES = 60  # at or below this, a failed edit dumps the whole file
+NEAR_MATCH_PREFIX = 60  # chars of old_string matched against to find near-hits
+LINE_NUMBER_WIDTH = 6  # read_file right-aligns line numbers in this many columns
+
 
 class ToolError(Exception):
     """A tool failed in a way the model can act on. Message goes back as-is."""
@@ -47,6 +56,15 @@ def truncate_middle(text: str, limit: int = MAX_OUTPUT_CHARS, marker: str = "\n.
     head = limit * 2 // 3
     tail = limit - head
     return text[:head] + marker + text[-tail:]
+
+
+def _numbered(lineno: int, text: str) -> str:
+    """One source line, prefixed with its aligned line number and a tab.
+
+    Every tool that shows file content uses this, so the model learns one
+    format instead of re-parsing a different one per tool.
+    """
+    return f"{lineno:{LINE_NUMBER_WIDTH}d}\t{text}\n"
 
 
 # --------------------------------------------------------------------------
@@ -98,6 +116,14 @@ class Workspace:
         except ValueError:  # different drive on some platforms
             return absolute
 
+    def display(self, absolute: str) -> str:
+        """`rel`, but '.' for the root itself rather than an empty string.
+
+        One rule for "how do I name this path to the model", so no tool has to
+        remember the `or '.'` half of it.
+        """
+        return self.rel(absolute) or "."
+
 
 # --------------------------------------------------------------------------
 # implementations
@@ -132,11 +158,10 @@ def make_read_file(ws: Workspace) -> Callable[..., str]:
         if not chunk:
             return f"{path} is empty (0 lines)."
 
-        body = "".join(
-            f"{offset + i:6d}\t{line.rstrip(chr(10))}\n" for i, line in enumerate(chunk)
-        )
-        header = f"{path} (lines {offset}-{offset + len(chunk) - 1} of {total})\n"
-        footer = "" if offset + len(chunk) - 1 >= total else f"\n... {total - (offset + len(chunk) - 1)} more lines; read with offset={offset + len(chunk)}\n"
+        first, last = offset, offset + len(chunk) - 1
+        body = "".join(_numbered(first + i, line.rstrip(chr(10))) for i, line in enumerate(chunk))
+        header = f"{path} (lines {first}-{last} of {total})\n"
+        footer = "" if last >= total else f"\n... {total - last} more lines; read with offset={last + 1}\n"
         return header + body + footer
 
     return read_file
@@ -154,6 +179,39 @@ def make_write_file(ws: Workspace) -> Callable[..., str]:
         return f"{verb} {path} ({n_lines} lines, {len(content)} bytes)"
 
     return write_file
+
+
+def _miss_hint(text: str, old_string: str) -> str:
+    """Why the match failed, plus enough of the file to fix it.
+
+    Telling the model *how close it got* is the difference between one retry
+    and five, so this returns copy-pasteable text rather than a diagnosis.
+    """
+    lines = text.splitlines()
+    if len(lines) <= SMALL_FILE_LINES:
+        # Small file: showing all of it is the most useful recovery we can
+        # offer, because the model can then copy an exact line instead of
+        # guessing at whitespace again.
+        body = "".join(_numbered(i + 1, ln) for i, ln in enumerate(lines))
+        return (
+            f"\n\nHere is the whole file ({len(lines)} lines). Copy from it exactly, "
+            f"including indentation:\n{body}"
+        )
+
+    first = old_string.strip().splitlines()[0] if old_string.strip() else ""
+    near = [
+        _numbered(i + 1, ln).rstrip("\n")
+        for i, ln in enumerate(lines)
+        if first and first[:NEAR_MATCH_PREFIX] in ln
+    ][:MAX_NEAR_MATCHES]
+    if not near:
+        return ""
+    return (
+        "\n\nA line starting like your old_string was found here -- your match "
+        "probably has wrong indentation or trailing whitespace:\n"
+        + "\n".join(near)
+        + "\nCopy the exact text from the file, including indentation."
+    )
 
 
 def make_edit_file(ws: Workspace) -> Callable[..., str]:
@@ -176,44 +234,22 @@ def make_edit_file(ws: Workspace) -> Callable[..., str]:
 
         count = text.count(old_string)
         if count == 0:
-            lines = text.splitlines()
-            if len(lines) <= 60:
-                # Small file: showing all of it is the most useful recovery
-                # we can offer, because the model can then copy an exact line
-                # instead of guessing at whitespace again.
-                body = "".join(f"{i + 1:6d}\t{ln}\n" for i, ln in enumerate(lines))
-                hint = (
-                    f"\n\nHere is the whole file ({len(lines)} lines). Copy from it exactly, "
-                    f"including indentation:\n{body}"
-                )
-            else:
-                first = old_string.strip().splitlines()[0] if old_string.strip() else ""
-                near = [
-                    f"{i + 1:6d}\t{ln}"
-                    for i, ln in enumerate(lines)
-                    if first and first[:60] in ln
-                ][:20]
-                hint = ""
-                if near:
-                    hint = (
-                        "\n\nA line starting like your old_string was found here -- your match "
-                        "probably has wrong indentation or trailing whitespace:\n"
-                        + "\n".join(near)
-                        + "\nCopy the exact text from the file, including indentation."
-                    )
             raise ToolError(
-                f"old_string not found in {path} (searched {len(text)} chars).{hint}"
+                f"old_string not found in {path} (searched {len(text)} chars)."
+                + _miss_hint(text, old_string)
             )
 
+        source_lines = text.splitlines()
         if count > 1 and not replace_all:
             positions = [text[:i].count("\n") + 1 for i in _find_all(text, old_string)]
+            first_few = positions[:MAX_SHOWN_MATCHES]
             shown = "\n".join(
-                f"{ln:6d}\t{text.splitlines()[ln - 1]}"
-                for ln in positions[:10]
-                if 0 < ln <= len(text.splitlines())
+                _numbered(ln, source_lines[ln - 1]).rstrip("\n")
+                for ln in first_few
+                if 0 < ln <= len(source_lines)
             )
             raise ToolError(
-                f"old_string appears {count} times in {path} (lines {positions[:10]}). "
+                f"old_string appears {count} times in {path} (lines {first_few}). "
                 "Include more surrounding context so the match is unique, or set "
                 f"replace_all=true.\n\n{shown}"
             )
@@ -250,9 +286,9 @@ def make_list_dir(ws: Workspace) -> Callable[..., str]:
 
         entries = sorted(os.listdir(target), key=lambda n: (not os.path.isdir(os.path.join(target, n)), n.lower()))
         if not entries:
-            return f"{ws.rel(target) or '.'} is empty."
+            return f"{ws.display(target)} is empty."
         rows = []
-        for name in entries[:300]:
+        for name in entries[:MAX_LIST_ENTRIES]:
             full = os.path.join(target, name)
             if os.path.isdir(full):
                 rows.append(f"  {name}/")
@@ -262,18 +298,49 @@ def make_list_dir(ws: Workspace) -> Callable[..., str]:
                 except OSError:
                     size = -1
                 rows.append(f"  {name}  ({size} bytes)")
-        more = "" if len(entries) <= 300 else f"\n... {len(entries) - 300} more entries"
-        prefix = ws.rel(target) or "."
-        return f"{prefix}/ contains {len(entries)} entries:\n" + "\n".join(rows) + more
+        more = "" if len(entries) <= MAX_LIST_ENTRIES else f"\n... {len(entries) - MAX_LIST_ENTRIES} more entries"
+        return f"{ws.display(target)}/ contains {len(entries)} entries:\n" + "\n".join(rows) + more
 
     return list_dir
+
+
+_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
+
+
+def _grep_file(
+    rx: "re.Pattern[str]", path: str, show: Callable[[str], str], limit: int
+) -> list[str]:
+    """Up to `limit` matches in one file, as `path:line: text`.
+
+    Stops reading once it has enough. Without the limit, grepping a dense
+    2MB file would scan all of it to return the first line the caller wanted.
+    """
+    out: list[str] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for n, line in enumerate(fh, 1):
+                if rx.search(line):
+                    out.append(f"{show(path)}:{n}: {line.rstrip()[:MAX_MATCH_CHARS]}")
+                    if len(out) >= limit:
+                        break
+    except OSError:
+        return out
+    return out
 
 
 def make_grep(ws: Workspace) -> Callable[..., str]:
     def grep(pattern: str, path: str = ".", glob: str = "*", is_regex: bool = False) -> str:
         if not pattern:
             raise ToolError("pattern must not be empty.")
-        rx = re.compile(pattern if is_regex else re.escape(pattern))
+        try:
+            rx = re.compile(pattern if is_regex else re.escape(pattern))
+        except re.error as exc:
+            # A malformed pattern is the model's mistake, not a tool crash. It
+            # must come back as advice, never as a stdlib traceback.
+            raise ToolError(
+                f"pattern is not a valid regex: {exc}. Fix the pattern, or set "
+                "is_regex=false to search for this text literally."
+            ) from exc
         root = ws.resolve(path)
         if not os.path.exists(root):
             raise ToolError(f"no such path: {path}")
@@ -281,39 +348,34 @@ def make_grep(ws: Workspace) -> Callable[..., str]:
         hits: list[str] = []
         skipped = 0
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [
-                d for d in dirnames if d not in {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
-            ]
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
             for fname in filenames:
+                room = MAX_GREP_LINES - len(hits)
+                if room <= 0:
+                    break
                 if not fnmatch.fnmatch(fname, glob):
                     continue
                 full = os.path.join(dirpath, fname)
-                if os.path.getsize(full) > 2_000_000:
+                try:
+                    oversized = os.path.getsize(full) > MAX_GREP_FILE_BYTES
+                except OSError:
+                    oversized = False  # unstattable (broken link, no permission)
+                if oversized:
                     skipped += 1
                     continue
-                try:
-                    with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                        for n, line in enumerate(fh, 1):
-                            if rx.search(line):
-                                hits.append(f"{ws.rel(full)}:{n}: {line.rstrip()[:300]}")
-                                if len(hits) >= MAX_GREP_LINES:
-                                    break
-                except OSError:
-                    continue
-                if len(hits) >= MAX_GREP_LINES:
-                    break
+                hits.extend(_grep_file(rx, full, ws.rel, room))
             if len(hits) >= MAX_GREP_LINES:
                 break
 
         if not hits:
-            where = f" in {ws.rel(root) or '.'}" if root != ws.root else ""
+            where = "" if root == ws.root else f" in {ws.display(root)}"
             scope = f" (files matching {glob})" if glob != "*" else ""
             return f"no matches for {pattern!r}{where}{scope}. Nothing to do here."
         note = ""
         if len(hits) >= MAX_GREP_LINES:
             note = f"\n... stopped at {MAX_GREP_LINES} matches; narrow the pattern or set glob to see more."
         if skipped:
-            note += f"\n... skipped {skipped} file(s) larger than 2MB."
+            note += f"\n... skipped {skipped} file(s) larger than {MAX_GREP_FILE_BYTES // 1_000_000}MB."
         return "\n".join(hits) + note
 
     return grep

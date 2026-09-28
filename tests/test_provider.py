@@ -27,6 +27,17 @@ from agent.tools import build_tools, Workspace  # noqa: E402
 from agent.loop import _to_openai_tool_calls  # noqa: E402
 
 
+def _reply(payload: dict):
+    """A stand-in for urlopen that returns `payload` as the API response."""
+    def urlopen(req, timeout=None):
+        return mock.MagicMock(
+            __enter__=lambda s: s,
+            __exit__=lambda s, *a: False,
+            read=lambda: json.dumps(payload).encode(),
+        )
+    return urlopen
+
+
 class TestResponseParsing(unittest.TestCase):
     def test_tool_call_arguments_are_parsed_from_the_json_string(self):
         turn = openai_to_assistant_turn(
@@ -115,11 +126,26 @@ class TestRequestBuilding(unittest.TestCase):
 
 class TestOpenAIProviderConfig(unittest.TestCase):
     def test_no_key_is_a_clear_error_not_a_401_later(self):
-        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
+        # `None` means "go and find a key"; not finding one has to fail here,
+        # naming the variables, rather than at the first request as a bare 401.
+        with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(ProviderError) as ctx:
-                OpenAIProvider(api_key="")
-        self.assertIn("OPENAI_API_KEY", str(ctx.exception))
-        self.assertIn("MockProvider", str(ctx.exception))
+                OpenAIProvider()
+        msg = str(ctx.exception)
+        self.assertIn("OPENAI_API_KEY", msg)
+        self.assertIn("DEEPSEEK_API_KEY", msg)
+        self.assertIn("--demo", msg)
+
+    def test_an_empty_key_means_this_endpoint_needs_no_auth(self):
+        # A local vLLM is the case. Forcing a dummy key in to satisfy a check
+        # that does not apply to it would be worse than sending no header.
+        p = OpenAIProvider(api_key="", base_url="http://localhost:8000/v1", model="m")
+        self.assertEqual(p.api_key, "")
+        self.assertNotIn("Authorization", p._headers())
+
+    def test_a_key_means_the_authorization_header_is_present(self):
+        p = OpenAIProvider(api_key="sk-1", base_url="http://x/v1", model="m")
+        self.assertEqual(p._headers()["Authorization"], "Bearer sk-1")
 
     def test_env_vars_are_the_default_source(self):
         env = {"OPENAI_API_KEY": "sk-test", "OPENAI_BASE_URL": "https://example.test/v1", "OPENAI_MODEL": "m1"}
@@ -147,6 +173,85 @@ class TestOpenAIProviderConfig(unittest.TestCase):
                 p.complete([{"role": "user", "content": "hi"}], [])
         self.assertIn("HTTP 401", str(ctx.exception))
         self.assertIn("bad key", str(ctx.exception))
+
+    def test_a_truncated_reply_says_so_instead_of_looking_terse(self):
+        # finish_reason=length means the output ran out mid-sentence. The
+        # model does not know that, so it would report success and stop --
+        # which reads as the agent deciding to be brief.
+        payload = {
+            "choices": [
+                {"finish_reason": "length", "message": {"content": "I looked at the", "tool_calls": []}}
+            ]
+        }
+        with mock.patch("urllib.request.urlopen", _reply(payload)):
+            turn = OpenAIProvider(api_key="k", base_url="https://x.test/v1", model="m").complete(
+                [{"role": "user", "content": "hi"}], []
+            )
+        self.assertIn("I looked at the", turn.text)
+        self.assertIn("output token limit", turn.text)
+
+    def test_a_complete_reply_is_not_annotated(self):
+        payload = {"choices": [{"finish_reason": "stop", "message": {"content": "all done", "tool_calls": []}}]}
+        with mock.patch("urllib.request.urlopen", _reply(payload)):
+            turn = OpenAIProvider(api_key="k", base_url="https://x.test/v1", model="m").complete(
+                [{"role": "user", "content": "hi"}], []
+            )
+        self.assertEqual(turn.text, "all done")
+
+    def test_a_truncated_reply_that_made_tool_calls_is_left_alone(self):
+        # The tool results are the useful part; a truncation note on top would
+        # be noise, and the calls are what the loop acts on.
+        payload = {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {"id": "c1", "type": "function",
+                             "function": {"name": "list_dir", "arguments": "{}"}}
+                        ],
+                    },
+                }
+            ]
+        }
+        with mock.patch("urllib.request.urlopen", _reply(payload)):
+            turn = OpenAIProvider(api_key="k", base_url="https://x.test/v1", model="m").complete(
+                [{"role": "user", "content": "hi"}], []
+            )
+        self.assertEqual([c.name for c in turn.tool_calls], ["list_dir"])
+        self.assertNotIn("output token limit", turn.text)
+
+    def test_serialized_turns_are_requested_explicitly(self):
+        # We want one action per turn so the model re-reads state after every
+        # change. Asking costs one line in the body; not asking means the
+        # model batches by default. Note the loop still *answers* a batched
+        # turn if one arrives -- this only asserts that we ask nicely.
+        sent = {}
+
+        def fake_urlopen(req, timeout=None):
+            sent["body"] = json.loads(req.data)
+            return _reply({"choices": [{"message": {"content": "ok", "tool_calls": []}}]})(req)
+
+        p = OpenAIProvider(api_key="k", base_url="https://example.test/v1", model="m")
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            p.complete([{"role": "user", "content": "hi"}], [{"name": "n", "description": "d", "parameters": {}}])
+        self.assertIs(sent["body"]["parallel_tool_calls"], False)
+        self.assertEqual(sent["body"]["tool_choice"], "auto")
+
+    def test_unreachable_endpoint_surfaces_the_reason(self):
+        # The other transport failure mode. Distinct from HTTPError because
+        # the fix is different: a key problem vs. a network/DNS problem.
+        import urllib.error
+
+        p = OpenAIProvider(api_key="k", base_url="https://example.test/v1")
+        boom = urllib.error.URLError("Name or service not known")
+        with mock.patch("urllib.request.urlopen", side_effect=boom):
+            with self.assertRaises(ProviderError) as ctx:
+                p.complete([{"role": "user", "content": "hi"}], [])
+        msg = str(ctx.exception)
+        self.assertIn("cannot reach", msg)
+        self.assertIn("Name or service not known", msg)
 
     def test_empty_choices_is_an_error(self):
         p = OpenAIProvider(api_key="k", base_url="https://example.test/v1")
