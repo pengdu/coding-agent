@@ -1,0 +1,4 @@
+.demo_run/
+__pycache__/
+*.pyc
+.env
