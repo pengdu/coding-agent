@@ -57,6 +57,18 @@ class TestLoadManifest(unittest.TestCase):
         self.assertEqual(manifest.allowed_paths, ("src", "tests"))
         self.assertEqual(manifest.timeout_seconds, 60)
 
+    def test_category_defaults_expected_outcome_and_rejects_unknown_values(self):
+        self.write_manifest({**self.valid_manifest(), "category": "bugfix"})
+
+        manifest = load_manifest(self.path)
+
+        self.assertEqual(manifest.category, "bugfix")
+        self.assertEqual(manifest.expected_outcome, "success")
+
+        self.write_manifest({**self.valid_manifest(), "category": "unknown"})
+        with self.assertRaisesRegex(ManifestError, "category"):
+            load_manifest(self.path)
+
     @staticmethod
     def valid_manifest(**overrides):
         return {

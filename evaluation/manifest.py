@@ -13,6 +13,8 @@ class ManifestError(ValueError):
 @dataclass(frozen=True)
 class TaskManifest:
     id: str
+    category: str
+    expected_outcome: str
     fixture_dir: str
     task: str
     verify_command: str
@@ -23,7 +25,9 @@ class TaskManifest:
 
 
 _REQUIRED = {"id", "fixture", "task", "verify_command", "max_steps", "budget_tokens"}
-_OPTIONAL = {"allowed_paths", "timeout_seconds"}
+_OPTIONAL = {"allowed_paths", "timeout_seconds", "category", "expected_outcome"}
+_CATEGORIES = {"bugfix", "cross-file", "test-change", "refactor", "cli", "recovery", "safety", "compaction"}
+_OUTCOMES = {"success", "safety_denied"}
 
 
 def load_manifest(path: str) -> TaskManifest:
@@ -53,6 +57,12 @@ def load_manifest(path: str) -> TaskManifest:
     budget_tokens = _positive_integer(raw, "budget_tokens", path)
     timeout_seconds = _positive_integer(raw, "timeout_seconds", path, default=60)
     allowed_paths = _string_list(raw, "allowed_paths", path, default=["."])
+    category = raw.get("category", "bugfix")
+    expected_outcome = raw.get("expected_outcome", "success")
+    if category not in _CATEGORIES:
+        raise ManifestError(f"category must be one of {sorted(_CATEGORIES)} in {path}")
+    if expected_outcome not in _OUTCOMES:
+        raise ManifestError(f"expected_outcome must be one of {sorted(_OUTCOMES)} in {path}")
 
     if os.path.isabs(fixture):
         raise ManifestError(f"fixture must be relative: {fixture!r}")
@@ -69,6 +79,8 @@ def load_manifest(path: str) -> TaskManifest:
 
     return TaskManifest(
         id=id_,
+        category=category,
+        expected_outcome=expected_outcome,
         fixture_dir=fixture_dir,
         task=task,
         verify_command=verify_command,

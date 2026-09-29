@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import subprocess
 import tempfile
 import unittest
 
@@ -60,6 +61,7 @@ class TestRunTask(unittest.TestCase):
         os.makedirs(self.fixture)
         with open(os.path.join(self.fixture, "answer.txt"), "w", encoding="utf-8") as fh:
             fh.write("old")
+        self.make_git_fixture()
         self.manifest_path = os.path.join(self.task_dir, "task.json")
         self.script_path = os.path.join(self.task_dir, "script.json")
         with open(self.manifest_path, "w", encoding="utf-8") as fh:
@@ -84,6 +86,10 @@ class TestRunTask(unittest.TestCase):
     def test_successful_scripted_task(self):
         result = run_task(self.manifest_path, os.path.join(self._tmp.name, "out"))
 
+        self.assertEqual(result.initial_commit, self.initial_commit)
+        self.assertIn("answer.txt", result.changed_paths)
+        self.assertTrue(os.path.exists(result.diff_path))
+        self.assertIsNone(result.failure_stage)
         self.assertEqual(result.outcome, "success")
         self.assertEqual(result.run["stop_reason"], "done")
         self.assertEqual(result.verification["returncode"], 0)
@@ -91,11 +97,18 @@ class TestRunTask(unittest.TestCase):
         with open(os.path.join(self.fixture, "answer.txt"), encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "old")
 
+    def make_git_fixture(self):
+        subprocess.run(["git", "init", "-q"], cwd=self.fixture, check=True)
+        subprocess.run(["git", "add", "."], cwd=self.fixture, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"], cwd=self.fixture, check=True)
+        self.initial_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.fixture, check=True, capture_output=True, text=True).stdout.strip()
+
     def test_classifies_failure_modes_in_priority_order(self):
         self.assertEqual(classify_run(Run(task="t", stop_reason="provider error: offline"), 0, False), "provider_error")
         self.assertEqual(classify_run(Run(task="t", stop_reason="step limit reached (2 steps)"), 0, False), "step_limit")
         self.assertEqual(classify_run(Run(task="t", stop_reason="done"), 1, False), "verification_failure")
         self.assertEqual(classify_run(Run(task="t", stop_reason="done"), None, True), "verification_failure")
+        self.assertEqual(classify_run(Run(task="t", stop_reason="done", tool_denials=1), 0, False), "safety_denied")
         self.assertEqual(classify_run(Run(task="t", stop_reason="done", tool_errors=1), 0, False), "tool_error")
 
 
@@ -126,6 +139,9 @@ class TestSuiteReporting(unittest.TestCase):
         os.makedirs(fixture)
         with open(os.path.join(fixture, "answer.txt"), "w", encoding="utf-8") as fh:
             fh.write(initial)
+        subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+        subprocess.run(["git", "add", "."], cwd=fixture, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"], cwd=fixture, check=True)
         with open(os.path.join(task_dir, "task.json"), "w", encoding="utf-8") as fh:
             json.dump({
                 "id": task_id, "fixture": "fixture", "task": "Set answer.",
