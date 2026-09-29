@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from agent import Agent, Workspace
@@ -28,6 +30,44 @@ class EvaluationResult:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+def run_suite(tasks_root: str, output_root: str) -> list[EvaluationResult]:
+    manifests = sorted(Path(tasks_root).glob("*/task.json"))
+    if not manifests:
+        raise ValueError(f"no task manifests found in {tasks_root}")
+    return [_run_task_catching_failures(str(path), output_root) for path in manifests]
+
+
+def write_reports(results: list[EvaluationResult], output_root: str) -> tuple[str, str]:
+    os.makedirs(output_root, exist_ok=True)
+    jsonl_path = os.path.join(output_root, "results.jsonl")
+    summary_path = os.path.join(output_root, "summary.json")
+    with open(jsonl_path, "w", encoding="utf-8") as fh:
+        for result in results:
+            fh.write(json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True) + "\n")
+    outcomes: dict[str, int] = {}
+    for result in results:
+        outcomes[result.outcome] = outcomes.get(result.outcome, 0) + 1
+    with open(summary_path, "w", encoding="utf-8") as fh:
+        json.dump({"total": len(results), "outcomes": dict(sorted(outcomes.items()))}, fh, ensure_ascii=False, sort_keys=True)
+    return jsonl_path, summary_path
+
+
+def _run_task_catching_failures(manifest_path: str, output_root: str) -> EvaluationResult:
+    try:
+        return run_task(manifest_path, output_root)
+    except Exception as exc:
+        task_id = Path(manifest_path).parent.name
+        return EvaluationResult(
+            task_id=task_id,
+            outcome="verification_failure",
+            run={},
+            verification={"error": f"{type(exc).__name__}: {exc}"},
+            workspace="",
+            started_at=datetime.now(UTC).isoformat(),
+            elapsed_seconds=0.0,
+        )
 
 
 def run_task(manifest_path: str, output_root: str) -> EvaluationResult:

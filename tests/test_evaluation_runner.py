@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from evaluation.manifest import ManifestError  # noqa: E402
 from evaluation.task_provider import load_scripted_provider  # noqa: E402
-from evaluation.runner import classify_run, run_task  # noqa: E402
+from evaluation.runner import classify_run, run_suite, run_task, write_reports  # noqa: E402
 from agent.loop import Run  # noqa: E402
 
 
@@ -97,6 +97,48 @@ class TestRunTask(unittest.TestCase):
         self.assertEqual(classify_run(Run(task="t", stop_reason="done"), 1, False), "verification_failure")
         self.assertEqual(classify_run(Run(task="t", stop_reason="done"), None, True), "verification_failure")
         self.assertEqual(classify_run(Run(task="t", stop_reason="done", tool_errors=1), 0, False), "tool_error")
+
+
+class TestSuiteReporting(unittest.TestCase):
+    def test_suite_continues_and_writes_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = os.path.join(tmp, "tasks")
+            self.make_task(tasks, "bad", "old", "wrong")
+            self.make_task(tasks, "good", "old", "new")
+
+            results = run_suite(tasks, os.path.join(tmp, "out"))
+            jsonl_path, summary_path = write_reports(results, os.path.join(tmp, "reports"))
+
+            self.assertEqual([result.task_id for result in results], ["bad", "good"])
+            self.assertEqual(results[0].outcome, "verification_failure")
+            self.assertEqual(results[1].outcome, "success")
+            with open(jsonl_path, encoding="utf-8") as fh:
+                self.assertEqual(len(fh.read().splitlines()), 2)
+            with open(summary_path, encoding="utf-8") as fh:
+                summary = json.load(fh)
+            self.assertEqual(summary["total"], 2)
+            self.assertEqual(summary["outcomes"], {"success": 1, "verification_failure": 1})
+
+    @staticmethod
+    def make_task(root, task_id, initial, expected):
+        task_dir = os.path.join(root, task_id)
+        fixture = os.path.join(task_dir, "fixture")
+        os.makedirs(fixture)
+        with open(os.path.join(fixture, "answer.txt"), "w", encoding="utf-8") as fh:
+            fh.write(initial)
+        with open(os.path.join(task_dir, "task.json"), "w", encoding="utf-8") as fh:
+            json.dump({
+                "id": task_id, "fixture": "fixture", "task": "Set answer.",
+                "verify_command": f"python3 -c \"assert open('answer.txt').read() == '{expected}'\"",
+                "max_steps": 3, "budget_tokens": 8000,
+            }, fh)
+        with open(os.path.join(task_dir, "script.json"), "w", encoding="utf-8") as fh:
+            json.dump([
+                {"text": "edit", "tool_calls": [{"id": "edit", "name": "edit_file", "arguments": {
+                    "path": "answer.txt", "old_string": initial, "new_string": "new",
+                }}]},
+                {"text": "done"},
+            ], fh)
 
 
 if __name__ == "__main__":

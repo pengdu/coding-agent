@@ -75,7 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
     """The CLI's flags, in one place so tests can parse without running."""
     p = argparse.ArgumentParser(prog="coding-agent", description="A small coding agent.")
     p.add_argument("task", nargs="?", help="what you want done")
-    p.add_argument("--demo", action="store_true", help="run the scripted demo, no API key needed")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--demo", action="store_true", help="run the scripted demo, no API key needed")
+    group.add_argument("--eval-dir", metavar="DIR", help="run deterministic evaluation tasks from DIR")
     p.add_argument("--config", metavar="FILE",
                    help="JSON file of model profiles (default: look for "
                         f"{' or '.join(CONFIG_FILENAMES)} in this directory and upwards)")
@@ -89,6 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--budget-tokens", type=int, default=60_000, help="context budget before compaction")
     p.add_argument("--model", help="model id, overriding the profile's")
     p.add_argument("--base-url", help="base url, overriding the profile's")
+    p.add_argument("--eval-output", metavar="DIR", default=".eval_runs", help="write evaluation reports and workspaces here")
     p.add_argument("--quiet", "-q", action="store_true", help="only print the final answer")
     return p
 
@@ -96,10 +99,25 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    if not args.list_profiles and not args.demo and not args.task:
+    if not args.list_profiles and not args.demo and not args.eval_dir and not args.task:
         # Checked before touching the config: a user who forgot the task should
         # be told that, not told their API key is missing.
-        build_parser().error("give a task, or pass --demo")
+        build_parser().error("give a task, pass --demo, or pass --eval-dir")
+
+    if args.eval_dir:
+        from evaluation.runner import run_suite, write_reports
+
+        try:
+            results = run_suite(args.eval_dir, args.eval_output)
+        except ValueError as exc:
+            print(f"evaluation problem: {exc}", file=sys.stderr)
+            return 2
+        jsonl_path, summary_path = write_reports(results, args.eval_output)
+        succeeded = sum(result.outcome == "success" for result in results)
+        print(f"evaluations: {len(results)} | success: {succeeded}")
+        print(f"results: {jsonl_path}")
+        print(f"summary: {summary_path}")
+        return 0 if succeeded == len(results) else 1
 
     try:
         if args.list_profiles:

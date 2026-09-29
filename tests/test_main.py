@@ -40,7 +40,7 @@ class TestArgumentValidation(unittest.TestCase):
             with self.subTest(argv=argv), self.assertRaises(SystemExit) as ctx, redirect_stderr(err):
                 cli.main(argv)
             self.assertEqual(ctx.exception.code, 2, "usage error must be exit 2, not a traceback")
-            self.assertIn("give a task, or pass --demo", err.getvalue())
+            self.assertIn("give a task, pass --demo, or pass --eval-dir", err.getvalue())
 
     def test_help_documents_the_flags_a_user_has_to_remember(self):
         # --help is the only interface documentation the CLI has, so a flag
@@ -303,6 +303,25 @@ class TestDemoRun(unittest.TestCase):
             # That is fine: the assertion is about *where* it was pointed.
             self.assertIn(os.path.realpath(tmp), out)
             self.assertNotIn(".demo_run", out)
+
+
+class TestEvaluationCli(unittest.TestCase):
+    def test_eval_dir_runs_without_resolving_a_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task_dir = os.path.join(tmp, "tasks", "answer")
+            fixture = os.path.join(task_dir, "fixture")
+            os.makedirs(fixture)
+            with open(os.path.join(fixture, "answer.txt"), "w") as fh:
+                fh.write("old")
+            with open(os.path.join(task_dir, "task.json"), "w") as fh:
+                json.dump({"id": "answer", "fixture": "fixture", "task": "Set answer.", "verify_command": "python3 -c \"assert open('answer.txt').read() == 'new'\"", "max_steps": 3, "budget_tokens": 8000}, fh)
+            with open(os.path.join(task_dir, "script.json"), "w") as fh:
+                json.dump([{"text": "edit", "tool_calls": [{"id": "edit", "name": "edit_file", "arguments": {"path": "answer.txt", "old_string": "old", "new_string": "new"}}]}, {"text": "done"}], fh)
+            output = os.path.join(tmp, "out")
+            with mock.patch.dict(os.environ, {}, clear=True):
+                code = cli.main(["--eval-dir", os.path.join(tmp, "tasks"), "--eval-output", output])
+            self.assertEqual(code, 0)
+            self.assertTrue(os.path.exists(os.path.join(output, "summary.json")))
 
 
 if __name__ == "__main__":
