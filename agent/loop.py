@@ -29,7 +29,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .context import Context
+from .context import Context, estimate_tokens
 from .provider import AssistantTurn, Provider, ToolCall
 from .prompts import SYSTEM_PROMPT
 from .tools import Tool, ToolDenied, ToolError, Workspace, build_tools, tool_schemas
@@ -57,7 +57,10 @@ class Run:
     stop_reason: str = ""
     tool_calls_made: int = 0
     tool_errors: int = 0
+    tool_denials: int = 0
     compactions: int = 0
+    estimated_tokens: int = 0
+    trace_events: list[dict[str, object]] = field(default_factory=list)
     turns_used: int = 0
     elapsed: float = 0.0
     trace: str = ""
@@ -117,11 +120,13 @@ class Agent:
         self.max_steps = max_steps
         self.budget_tokens = budget_tokens
         self.keep_recent = keep_recent
+        self._last_dispatch_denied = False
 
     # -- dispatch ---------------------------------------------------------
 
     def dispatch(self, call: ToolCall) -> tuple[str, bool]:
         """Run one tool. Returns (result_text, is_error)."""
+        self._last_dispatch_denied = False
         tool = self.tools.get(call.name)
         if tool is None:
             available = ", ".join(sorted(self.tools))
@@ -132,7 +137,10 @@ class Agent:
             )
         try:
             return tool.fn(**call.arguments), False
-        except (ToolError, ToolDenied) as exc:
+        except ToolDenied as exc:
+            self._last_dispatch_denied = True
+            return str(exc), True
+        except ToolError as exc:
             return str(exc), True
         except TypeError as exc:
             return (
@@ -158,6 +166,7 @@ class Agent:
 
         for i in range(1, self.max_steps + 1):
             emit(f"\n--- step {i} ---")
+            result.estimated_tokens += estimate_tokens(ctx.messages)
             try:
                 turn: AssistantTurn = self.provider.complete(ctx.messages, schemas)
             except Exception as exc:  # noqa: BLE001 - surface, never hide
@@ -186,10 +195,22 @@ class Agent:
             # limit -- the transcript's integrity outranks our preference.
             for call in turn.tool_calls:
                 output, is_error = self.dispatch(call)
+                denied = self._last_dispatch_denied
                 result.tool_calls_made += 1
                 if is_error:
                     result.tool_errors += 1
-                step.calls.append((call.name, _preview(call.arguments), _headline(output)))
+                if denied:
+                    result.tool_denials += 1
+                headline = _headline(output)
+                result.trace_events.append({
+                    "step": i,
+                    "tool": call.name,
+                    "arguments": _preview(call.arguments),
+                    "is_error": is_error,
+                    "is_denied": denied,
+                    "headline": headline,
+                })
+                step.calls.append((call.name, _preview(call.arguments), headline))
                 # Verbatim. The model must see the real error, not a summary
                 # of it, or it will retry the same broken call.
                 ctx.add_tool_result(call.id, call.name, output)

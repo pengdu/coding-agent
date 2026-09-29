@@ -289,6 +289,20 @@ class TestFailureModes(LoopTestCase):
         self.assertIn("outside the workspace", result)
 
 
+    def test_denials_are_structured_even_when_the_model_does_not_repeat_them(self):
+        provider = MockProvider([
+            turn("try", [call("run_command", {"command": "rm -rf /"})]),
+            turn("I cannot do that"),
+        ])
+
+        result = self.agent(provider).run("t")
+
+        self.assertEqual(result.tool_denials, 1)
+        self.assertTrue(result.trace_events[0]["is_denied"])
+        self.assertEqual(result.trace_events[0]["tool"], "run_command")
+        self.assertGreater(result.estimated_tokens, 0)
+
+
 class TestTranscript(LoopTestCase):
     def test_assistant_tool_calls_are_recorded_so_the_model_sees_its_own_actions(self):
         provider = MockProvider(
