@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -18,6 +19,12 @@ from .manifest import TaskManifest, load_manifest
 from .task_provider import load_scripted_provider
 
 SECURITY_SCOPE = "tool-policy-and-workspace-paths"
+
+
+@dataclass(frozen=True)
+class BaselineEvidence:
+    head: str
+    bundle_sha256: str
 
 
 @dataclass(frozen=True)
@@ -97,13 +104,15 @@ def write_reports(results: list[EvaluationResult], output_root: str) -> tuple[st
 
 def run_task(manifest_path: str, output_root: str) -> EvaluationResult:
     manifest = load_manifest(manifest_path)
+    task_dir = os.path.dirname(os.path.abspath(manifest_path))
     started = time.monotonic()
     started_at = datetime.now(UTC).isoformat()
-    workspace = _copy_fixture(manifest, output_root)
+    workspace = _workspace_path(manifest, output_root)
     try:
-        initial_commit = _validate_fixture_git(workspace)
+        baseline = restore_baseline(task_dir, workspace)
     except RuntimeError as exc:
-        return _failure_result(manifest, workspace, started_at, started, "fixture", str(exc))
+        return _failure_result(manifest, workspace, started_at, started, "fixture", str(exc), outcome="runner_failure")
+    initial_commit = baseline.head
 
     agent = Agent(
         provider=load_scripted_provider(_script_path(manifest_path)),
@@ -116,7 +125,11 @@ def run_task(manifest_path: str, output_root: str) -> EvaluationResult:
     try:
         diff_path, changed_paths = _collect_git_evidence(workspace, output_root, manifest.id)
     except RuntimeError as exc:
-        return _failure_result(manifest, workspace, started_at, started, "runner", str(exc), initial_commit, run)
+        return _failure_result(manifest, workspace, started_at, started, "runner", str(exc), initial_commit, run, outcome="runner_failure")
+    assertion_errors = _evaluate_assertions(task_dir, changed_paths, run, verification, workspace)
+    if assertion_errors:
+        verification["assertion_errors"] = assertion_errors
+        verification["returncode"] = 1
     path_error = _check_allowed_paths(changed_paths, manifest.allowed_paths)
     if path_error:
         verification["returncode"] = 1
@@ -148,10 +161,10 @@ def classify_run(run: Run, verify_returncode: int | None, verification_timed_out
         return "step_limit"
     if "budget" in reason.lower():
         return "budget_exhausted"
-    if run.tool_denials:
-        return "safety_denied"
     if verification_timed_out or verify_returncode != 0:
         return "verification_failure"
+    if run.tool_denials:
+        return "safety_denied"
     if run.tool_errors and not run.ok:
         return "tool_error"
     return "success" if run.ok else "verification_failure"
@@ -180,12 +193,12 @@ def _run_task_catching_failures(manifest_path: str, output_root: str) -> Evaluat
         )
 
 
-def _failure_result(manifest: TaskManifest, workspace: str, started_at: str, started: float, stage: str, error: str, initial_commit: str | None = None, run: Run | None = None) -> EvaluationResult:
+def _failure_result(manifest: TaskManifest, workspace: str, started_at: str, started: float, stage: str, error: str, initial_commit: str | None = None, run: Run | None = None, outcome: str = "verification_failure") -> EvaluationResult:
     return EvaluationResult(
         task_id=manifest.id,
         category=manifest.category,
         expected_outcome=manifest.expected_outcome,
-        outcome="verification_failure",
+        outcome=outcome,
         failure_stage=stage,
         run=_run_data(run) if run else {},
         verification={"error": error},
@@ -203,26 +216,45 @@ def _script_path(manifest_path: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(manifest_path)), "script.json")
 
 
-def _copy_fixture(manifest: TaskManifest, output_root: str) -> str:
+def restore_baseline(task_dir: str, workspace: str) -> BaselineEvidence:
+    bundle = os.path.join(task_dir, "baseline.bundle")
+    metadata = os.path.join(task_dir, "baseline.json")
+    if not os.path.isfile(bundle):
+        raise RuntimeError(f"missing baseline.bundle: {bundle}")
+    if not os.path.isfile(metadata):
+        raise RuntimeError(f"missing baseline.json: {metadata}")
+    try:
+        with open(metadata, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read baseline.json: {exc}") from exc
+    expected_head = raw.get("head")
+    expected_sha = raw.get("bundle_sha256")
+    if not isinstance(expected_head, str) or not isinstance(expected_sha, str):
+        raise RuntimeError("baseline.json requires string head and bundle_sha256")
+    with open(bundle, "rb") as fh:
+        actual_sha = hashlib.sha256(fh.read()).hexdigest()
+    if actual_sha != expected_sha:
+        raise RuntimeError("baseline.bundle SHA-256 does not match baseline.json")
+    if os.path.exists(workspace):
+        shutil.rmtree(workspace)
+    os.makedirs(os.path.dirname(workspace), exist_ok=True)
+    _git(["clone", "--quiet", bundle, workspace], task_dir)
+    head = _git(["rev-parse", "HEAD"], workspace).strip()
+    if head != expected_head:
+        raise RuntimeError(f"baseline HEAD mismatch: expected {expected_head}, got {head}")
+    if _git(["status", "--porcelain"], workspace):
+        raise RuntimeError("restored baseline Git status is not clean")
+    return BaselineEvidence(head=head, bundle_sha256=actual_sha)
+
+
+def _workspace_path(manifest: TaskManifest, output_root: str) -> str:
     workspace = os.path.realpath(os.path.join(output_root, "workspaces", manifest.id))
     root = os.path.realpath(os.path.join(output_root, "workspaces"))
     if workspace != root and not workspace.startswith(root + os.sep):
         raise ValueError(f"task id resolves outside evaluation output: {manifest.id!r}")
-    if os.path.exists(workspace):
-        shutil.rmtree(workspace)
-    os.makedirs(os.path.dirname(workspace), exist_ok=True)
-    shutil.copytree(manifest.fixture_dir, workspace)
     return workspace
 
-
-def _validate_fixture_git(workspace: str) -> str:
-    if not os.path.exists(os.path.join(workspace, ".git")):
-        _git(["init", "-q"], workspace)
-        _git(["add", "."], workspace)
-        _git(["-c", "user.name=Evaluation", "-c", "user.email=evaluation@example.invalid", "commit", "-qm", "initial"], workspace)
-    if _git(["status", "--porcelain"], workspace):
-        raise RuntimeError("fixture Git status is not clean")
-    return _git(["rev-parse", "HEAD"], workspace).strip()
 
 
 def _collect_git_evidence(workspace: str, output_root: str, task_id: str) -> tuple[str, list[str]]:
@@ -262,6 +294,35 @@ def _verify(command: str, workspace: str, timeout_seconds: int) -> dict[str, obj
 def _text(value: str | bytes | None) -> str:
     return value.decode() if isinstance(value, bytes) else value or ""
 
+
+def _evaluate_assertions(task_dir: str, changed_paths: list[str], run: Run, verification: dict[str, object], workspace: str) -> list[str]:
+    try:
+        with open(os.path.join(task_dir, "baseline.json"), encoding="utf-8") as fh:
+            assertions = json.load(fh).get("assertions") or {}
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"cannot read assertions: {exc}"]
+    errors: list[str] = []
+    for path in assertions.get("required_changed_paths", []):
+        if path not in changed_paths:
+            errors.append(f"required changed path missing: {path}")
+    minimum = assertions.get("minimum_changed_paths")
+    if isinstance(minimum, int) and len(changed_paths) < minimum:
+        errors.append(f"expected at least {minimum} changed paths, got {len(changed_paths)}")
+    required_run = assertions.get("required_run") or {}
+    if "compactions" in required_run and run.compactions < required_run["compactions"]:
+        errors.append(f"expected compactions >= {required_run['compactions']}, got {run.compactions}")
+    if "tool_denials" in required_run and run.tool_denials != required_run["tool_denials"]:
+        errors.append(f"expected tool_denials == {required_run['tool_denials']}, got {run.tool_denials}")
+    for sentinel in assertions.get("sentinels", []):
+        path = os.path.join(workspace, sentinel["path"])
+        try:
+            with open(path, "rb") as fh:
+                actual = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            actual = "<missing>"
+        if actual != sentinel["sha256"]:
+            errors.append(f"sentinel changed: {sentinel['path']}")
+    return errors
 
 def _check_allowed_paths(changed_paths: list[str], allowed_paths: tuple[str, ...]) -> str:
     disallowed = [path for path in changed_paths if not any(_allowed(path, allowed) for allowed in allowed_paths)]

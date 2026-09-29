@@ -103,8 +103,41 @@ class TestRunTask(unittest.TestCase):
         subprocess.run(["git", "add", "."], cwd=self.fixture, check=True)
         subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"], cwd=self.fixture, check=True)
         self.initial_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.fixture, check=True, capture_output=True, text=True).stdout.strip()
+        bundle = os.path.join(self.task_dir, "baseline.bundle")
+        subprocess.run(["git", "bundle", "create", bundle, "HEAD"], cwd=self.fixture, check=True)
+        import hashlib
+        with open(bundle, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        with open(os.path.join(self.task_dir, "baseline.json"), "w", encoding="utf-8") as fh:
+            json.dump({"head": self.initial_commit, "bundle_sha256": digest, "assertions": {}}, fh)
 
-    def test_classifies_failure_modes_in_priority_order(self):
+    def test_required_changed_path_assertion_fails_verification(self):
+        baseline = os.path.join(self.task_dir, "baseline.json")
+        with open(baseline, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["assertions"] = {"required_changed_paths": ["missing.py"]}
+        with open(baseline, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+        result = run_task(self.manifest_path, os.path.join(self._tmp.name, "out"))
+
+        self.assertEqual(result.outcome, "verification_failure")
+        self.assertIn("missing.py", result.verification["assertion_errors"][0])
+
+        from agent.loop import Run
+
+        result = classify_run(Run(task="t", stop_reason="done", tool_denials=1), 1, False)
+
+        self.assertEqual(result, "verification_failure")
+
+        os.remove(os.path.join(self.task_dir, "baseline.bundle"))
+
+        result = run_task(self.manifest_path, os.path.join(self._tmp.name, "out"))
+
+        self.assertEqual(result.outcome, "runner_failure")
+        self.assertEqual(result.failure_stage, "fixture")
+        self.assertIn("baseline.bundle", result.verification["error"])
+
         self.assertEqual(classify_run(Run(task="t", stop_reason="provider error: offline"), 0, False), "provider_error")
         self.assertEqual(classify_run(Run(task="t", stop_reason="step limit reached (2 steps)"), 0, False), "step_limit")
         self.assertEqual(classify_run(Run(task="t", stop_reason="done"), 1, False), "verification_failure")
@@ -140,9 +173,6 @@ class TestSuiteReporting(unittest.TestCase):
         os.makedirs(fixture)
         with open(os.path.join(fixture, "answer.txt"), "w", encoding="utf-8") as fh:
             fh.write(initial)
-        subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
-        subprocess.run(["git", "add", "."], cwd=fixture, check=True)
-        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"], cwd=fixture, check=True)
         with open(os.path.join(task_dir, "task.json"), "w", encoding="utf-8") as fh:
             json.dump({
                 "id": task_id, "fixture": "fixture", "task": "Set answer.",
@@ -156,6 +186,17 @@ class TestSuiteReporting(unittest.TestCase):
                 }}]},
                 {"text": "done"},
             ], fh)
+        subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+        subprocess.run(["git", "add", "."], cwd=fixture, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"], cwd=fixture, check=True)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=fixture, check=True, capture_output=True, text=True).stdout.strip()
+        bundle = os.path.join(task_dir, "baseline.bundle")
+        subprocess.run(["git", "bundle", "create", bundle, "HEAD"], cwd=fixture, check=True)
+        import hashlib
+        with open(bundle, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        with open(os.path.join(task_dir, "baseline.json"), "w", encoding="utf-8") as fh:
+            json.dump({"head": head, "bundle_sha256": digest, "assertions": {}}, fh)
 
     def test_timestamped_run_directories_and_expected_outcomes_are_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
