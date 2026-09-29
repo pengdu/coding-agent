@@ -8,6 +8,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from evaluation.manifest import ManifestError  # noqa: E402
 from evaluation.task_provider import load_scripted_provider  # noqa: E402
+from evaluation.runner import classify_run, run_task  # noqa: E402
+from agent.loop import Run  # noqa: E402
 
 
 class TestTaskProvider(unittest.TestCase):
@@ -47,6 +49,54 @@ class TestTaskProvider(unittest.TestCase):
                 self.write_script(value)
                 with self.assertRaisesRegex(ManifestError, message):
                     load_scripted_provider(self.path)
+
+
+class TestRunTask(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.task_dir = os.path.join(self._tmp.name, "task")
+        self.fixture = os.path.join(self.task_dir, "fixture")
+        os.makedirs(self.fixture)
+        with open(os.path.join(self.fixture, "answer.txt"), "w", encoding="utf-8") as fh:
+            fh.write("old")
+        self.manifest_path = os.path.join(self.task_dir, "task.json")
+        self.script_path = os.path.join(self.task_dir, "script.json")
+        with open(self.manifest_path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "id": "answer",
+                "fixture": "fixture",
+                "task": "Set the answer.",
+                "verify_command": "python3 -c \"assert open('answer.txt').read() == 'new'\"",
+                "max_steps": 4,
+                "budget_tokens": 8000,
+                "allowed_paths": ["answer.txt"],
+            }, fh)
+        with open(self.script_path, "w", encoding="utf-8") as fh:
+            json.dump([
+                {"text": "edit", "tool_calls": [{
+                    "id": "edit-1", "name": "edit_file",
+                    "arguments": {"path": "answer.txt", "old_string": "old", "new_string": "new"},
+                }]},
+                {"text": "done"},
+            ], fh)
+
+    def test_successful_scripted_task(self):
+        result = run_task(self.manifest_path, os.path.join(self._tmp.name, "out"))
+
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(result.run["stop_reason"], "done")
+        self.assertEqual(result.verification["returncode"], 0)
+        self.assertTrue(os.path.exists(os.path.join(result.workspace, "answer.txt")))
+        with open(os.path.join(self.fixture, "answer.txt"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "old")
+
+    def test_classifies_failure_modes_in_priority_order(self):
+        self.assertEqual(classify_run(Run(task="t", stop_reason="provider error: offline"), 0, False), "provider_error")
+        self.assertEqual(classify_run(Run(task="t", stop_reason="step limit reached (2 steps)"), 0, False), "step_limit")
+        self.assertEqual(classify_run(Run(task="t", stop_reason="done"), 1, False), "verification_failure")
+        self.assertEqual(classify_run(Run(task="t", stop_reason="done"), None, True), "verification_failure")
+        self.assertEqual(classify_run(Run(task="t", stop_reason="done", tool_errors=1), 0, False), "tool_error")
 
 
 if __name__ == "__main__":
