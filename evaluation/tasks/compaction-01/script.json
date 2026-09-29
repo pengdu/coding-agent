@@ -1,14 +1,110 @@
 [
   {
+    "text": "read",
+    "tool_calls": [
+      {
+        "id": "read0",
+        "name": "read_file",
+        "arguments": {
+          "path": "big.txt"
+        }
+      }
+    ]
+  },
+  {
+    "text": "read",
+    "tool_calls": [
+      {
+        "id": "read1",
+        "name": "read_file",
+        "arguments": {
+          "path": "big.txt"
+        }
+      }
+    ]
+  },
+  {
+    "text": "read",
+    "tool_calls": [
+      {
+        "id": "read2",
+        "name": "read_file",
+        "arguments": {
+          "path": "big.txt"
+        }
+      }
+    ]
+  },
+  {
+    "text": "read",
+    "tool_calls": [
+      {
+        "id": "read3",
+        "name": "read_file",
+        "arguments": {
+          "path": "big.txt"
+        }
+      }
+    ]
+  },
+  {
+    "text": "read",
+    "tool_calls": [
+      {
+        "id": "read4",
+        "name": "read_file",
+        "arguments": {
+          "path": "big.txt"
+        }
+      }
+    ]
+  },
+  {
+    "text": "read",
+    "tool_calls": [
+      {
+        "id": "read5",
+        "name": "read_file",
+        "arguments": {
+          "path": "big.txt"
+        }
+      }
+    ]
+  },
+  {
+    "text": "read",
+    "tool_calls": [
+      {
+        "id": "read6",
+        "name": "read_file",
+        "arguments": {
+          "path": "big.txt"
+        }
+      }
+    ]
+  },
+  {
+    "text": "read",
+    "tool_calls": [
+      {
+        "id": "read7",
+        "name": "read_file",
+        "arguments": {
+          "path": "big.txt"
+        }
+      }
+    ]
+  },
+  {
     "text": "edit",
     "tool_calls": [
       {
-        "id": "edit-1",
+        "id": "edit",
         "name": "edit_file",
         "arguments": {
-          "path": "answer.txt",
-          "old_string": "old",
-          "new_string": "new"
+          "path": "module.py",
+          "old_string": "VALUE = \"old\"",
+          "new_string": "VALUE = \"new\""
         }
       }
     ]

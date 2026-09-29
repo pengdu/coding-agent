@@ -3,12 +3,12 @@
     "text": "edit",
     "tool_calls": [
       {
-        "id": "edit-1",
+        "id": "edit",
         "name": "edit_file",
         "arguments": {
-          "path": "answer.txt",
-          "old_string": "old",
-          "new_string": "new"
+          "path": "module.py",
+          "old_string": "VALUE = \"old\"",
+          "new_string": "VALUE = \"new\""
         }
       }
     ]

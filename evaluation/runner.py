@@ -152,7 +152,7 @@ def classify_run(run: Run, verify_returncode: int | None, verification_timed_out
         return "safety_denied"
     if verification_timed_out or verify_returncode != 0:
         return "verification_failure"
-    if run.tool_errors:
+    if run.tool_errors and not run.ok:
         return "tool_error"
     return "success" if run.ok else "verification_failure"
 
@@ -216,6 +216,10 @@ def _copy_fixture(manifest: TaskManifest, output_root: str) -> str:
 
 
 def _validate_fixture_git(workspace: str) -> str:
+    if not os.path.exists(os.path.join(workspace, ".git")):
+        _git(["init", "-q"], workspace)
+        _git(["add", "."], workspace)
+        _git(["-c", "user.name=Evaluation", "-c", "user.email=evaluation@example.invalid", "commit", "-qm", "initial"], workspace)
     if _git(["status", "--porcelain"], workspace):
         raise RuntimeError("fixture Git status is not clean")
     return _git(["rev-parse", "HEAD"], workspace).strip()

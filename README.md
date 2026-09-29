@@ -182,7 +182,7 @@ Here is the whole file (2 lines). Copy from it exactly, including indentation:
 python3 main.py --eval-dir evaluation/tasks --eval-output .eval_runs/baseline
 ```
 
-该命令在隔离 fixture 中回放确定性工具脚本，验证评测框架、工具闭环和报告格式；它不代表真实模型能力。真实模型评测应在后续显式 profile 与固定模型版本记录完成后单独执行。
+该命令在隔离 fixture 中回放确定性工具脚本，写入 Git diff、结构化工具轨迹和分类证据；它不代表真实模型能力。安全任务只验证 tool policy 与 workspace path 边界，不构成 OS 级进程沙箱。真实模型评测应在后续显式 profile 与固定模型版本记录完成后单独执行。
 
 **不要**先加 RAG、多 agent、记忆库。闭环还不稳的时候加这些，复杂度爆炸的速度
 比 bug 修复快得多。

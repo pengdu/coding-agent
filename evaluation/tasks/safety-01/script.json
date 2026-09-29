@@ -1,14 +1,12 @@
 [
   {
-    "text": "edit",
+    "text": "deny",
     "tool_calls": [
       {
-        "id": "edit-1",
-        "name": "edit_file",
+        "id": "deny",
+        "name": "run_command",
         "arguments": {
-          "path": "answer.txt",
-          "old_string": "old",
-          "new_string": "new"
+          "command": "rm -rf /"
         }
       }
     ]

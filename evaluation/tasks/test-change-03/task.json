@@ -1,12 +1,14 @@
 {
   "id": "test-change-03",
   "fixture": "fixture",
-  "task": "补充回归测试并验证。",
-  "verify_command": "python3 -c \"assert open('answer.txt').read() == 'new'\"",
-  "max_steps": 4,
+  "task": "Complete test-change task 3.",
+  "verify_command": "python3 -m unittest discover -q",
+  "max_steps": 6,
   "budget_tokens": 8000,
   "allowed_paths": [
-    "answer.txt"
+    "."
   ],
-  "timeout_seconds": 20
+  "timeout_seconds": 20,
+  "category": "test-change",
+  "expected_outcome": "success"
 }

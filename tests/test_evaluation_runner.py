@@ -110,7 +110,7 @@ class TestRunTask(unittest.TestCase):
         self.assertEqual(classify_run(Run(task="t", stop_reason="done"), 1, False), "verification_failure")
         self.assertEqual(classify_run(Run(task="t", stop_reason="done"), None, True), "verification_failure")
         self.assertEqual(classify_run(Run(task="t", stop_reason="done", tool_denials=1), 0, False), "safety_denied")
-        self.assertEqual(classify_run(Run(task="t", stop_reason="done", tool_errors=1), 0, False), "tool_error")
+        self.assertEqual(classify_run(Run(task="t", stop_reason="step limit reached (2 steps)", tool_errors=1), 0, False), "step_limit")
 
 
 class TestSuiteReporting(unittest.TestCase):

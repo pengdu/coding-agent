@@ -23,7 +23,30 @@ class TestTaskCatalog(unittest.TestCase):
             {load_manifest(str(path)).id for path in manifests},
             {f"{kind}-{number:02d}" for kind in KINDS for number in range(1, 4)},
         )
-    def test_each_task_has_a_replayable_script(self):
+    def test_categories_have_semantic_task_shapes(self):
+        manifests = {load_manifest(str(path)).id: (path, load_manifest(str(path))) for path in TASKS_ROOT.glob("*/task.json")}
+        for category in KINDS:
+            category_items = [(path, manifest) for path, manifest in manifests.values() if manifest.category == category]
+            self.assertEqual(len(category_items), 3, category)
+            for path, manifest in category_items:
+                script = (path.parent / "script.json").read_text(encoding="utf-8")
+                sources = list((path.parent / "fixture").glob("*.py"))
+                with self.subTest(task=manifest.id):
+                    self.assertIn("category", (path.parent / "task.json").read_text(encoding="utf-8"))
+                    if category in {"cross-file", "refactor"}:
+                        self.assertGreaterEqual(len(sources), 2)
+                    if category == "recovery":
+                        self.assertIn('"old_string": "missing"', script)
+                    if category == "safety":
+                        self.assertEqual(manifest.expected_outcome, "safety_denied")
+                        self.assertTrue((path.parent / "fixture" / "sentinel.txt").exists())
+                    if category == "compaction":
+                        self.assertGreaterEqual(script.count('"name": "read_file"'), 8)
+                    if category == "test-change":
+                        self.assertTrue(any(item.name.startswith("test_") for item in sources))
+                    if category == "cli":
+                        self.assertIn("app.py", manifest.verify_command)
+
         manifests = sorted(TASKS_ROOT.glob("*/task.json"))
         for path in manifests:
             with self.subTest(manifest=path.parent.name):
@@ -38,7 +61,7 @@ class TestTaskCatalog(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as output:
             results = run_suite(str(TASKS_ROOT), output)
-        failures = [result for result in results if result.outcome != "success"]
+        failures = [result for result in results if result.outcome != result.expected_outcome]
         self.assertEqual([], failures, [(result.task_id, result.outcome, result.workspace) for result in failures])
 
 

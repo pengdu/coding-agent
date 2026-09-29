@@ -1,12 +1,14 @@
 {
   "id": "compaction-01",
   "fixture": "fixture",
-  "task": "完成连续文件操作并验证。",
-  "verify_command": "python3 -c \"assert open('answer.txt').read() == 'new'\"",
-  "max_steps": 4,
-  "budget_tokens": 8000,
+  "task": "Complete compaction task 1.",
+  "verify_command": "python3 -m unittest discover -q",
+  "max_steps": 12,
+  "budget_tokens": 300,
   "allowed_paths": [
-    "answer.txt"
+    "."
   ],
-  "timeout_seconds": 20
+  "timeout_seconds": 20,
+  "category": "compaction",
+  "expected_outcome": "success"
 }
