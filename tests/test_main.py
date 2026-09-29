@@ -12,10 +12,12 @@ directory is gitignored.
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -313,6 +315,9 @@ class TestEvaluationCli(unittest.TestCase):
             os.makedirs(fixture)
             with open(os.path.join(fixture, "answer.txt"), "w") as fh:
                 fh.write("old")
+            subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+            subprocess.run(["git", "add", "."], cwd=fixture, check=True)
+            subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"], cwd=fixture, check=True)
             with open(os.path.join(task_dir, "task.json"), "w") as fh:
                 json.dump({"id": "answer", "fixture": "fixture", "task": "Set answer.", "verify_command": "python3 -c \"assert open('answer.txt').read() == 'new'\"", "max_steps": 3, "budget_tokens": 8000}, fh)
             with open(os.path.join(task_dir, "script.json"), "w") as fh:
@@ -321,7 +326,7 @@ class TestEvaluationCli(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=True):
                 code = cli.main(["--eval-dir", os.path.join(tmp, "tasks"), "--eval-output", output])
             self.assertEqual(code, 0)
-            self.assertTrue(os.path.exists(os.path.join(output, "summary.json")))
+            self.assertEqual(len(list(Path(output).glob("*/summary.json"))), 1)
 
 
 if __name__ == "__main__":

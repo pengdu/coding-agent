@@ -41,6 +41,18 @@ class EvaluationResult:
         return asdict(self)
 
 
+def create_run_directory(output_root: str, now: datetime | None = None) -> str:
+    timestamp = (now or datetime.now(UTC)).strftime("%Y%m%dT%H%M%SZ")
+    base = os.path.join(output_root, timestamp)
+    candidate = base
+    suffix = 1
+    while os.path.exists(candidate):
+        candidate = f"{base}-{suffix:02d}"
+        suffix += 1
+    os.makedirs(candidate)
+    return candidate
+
+
 def run_suite(tasks_root: str, output_root: str) -> list[EvaluationResult]:
     manifests = sorted(Path(tasks_root).glob("*/task.json"))
     if not manifests:
@@ -60,11 +72,22 @@ def write_reports(results: list[EvaluationResult], output_root: str) -> tuple[st
     for result in results:
         outcomes[result.outcome] = outcomes.get(result.outcome, 0) + 1
         categories[result.category] = categories.get(result.category, 0) + 1
+    averages = {
+        "turns_used": sum(int(result.run.get("turns_used", 0)) for result in results) / len(results) if results else 0,
+        "estimated_tokens": sum(int(result.run.get("estimated_tokens", 0)) for result in results) / len(results) if results else 0,
+    }
+    totals = {
+        "tool_errors": sum(int(result.run.get("tool_errors", 0)) for result in results),
+        "tool_denials": sum(int(result.run.get("tool_denials", 0)) for result in results),
+        "compactions": sum(int(result.run.get("compactions", 0)) for result in results),
+    }
     summary = {
         "total": len(results),
         "task_passed": sum(result.outcome == result.expected_outcome for result in results),
         "outcomes": dict(sorted(outcomes.items())),
         "categories": dict(sorted(categories.items())),
+        "averages": averages,
+        "totals": totals,
         "security_scope": SECURITY_SCOPE,
     }
     with open(summary_path, "w", encoding="utf-8") as fh:

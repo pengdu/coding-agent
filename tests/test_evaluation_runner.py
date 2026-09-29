@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import subprocess
+from datetime import UTC, datetime
 import tempfile
 import unittest
 
@@ -9,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from evaluation.manifest import ManifestError  # noqa: E402
 from evaluation.task_provider import load_scripted_provider  # noqa: E402
-from evaluation.runner import classify_run, run_suite, run_task, write_reports  # noqa: E402
+from evaluation.runner import EvaluationResult, classify_run, create_run_directory, run_suite, run_task, write_reports  # noqa: E402
 from agent.loop import Run  # noqa: E402
 
 
@@ -155,6 +156,23 @@ class TestSuiteReporting(unittest.TestCase):
                 }}]},
                 {"text": "done"},
             ], fh)
+
+    def test_timestamped_run_directories_and_expected_outcomes_are_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            now = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
+            run_dir = create_run_directory(tmp, now)
+            next_run_dir = create_run_directory(tmp, now)
+            self.assertTrue(run_dir.endswith("20260929T120000Z"))
+            self.assertTrue(next_run_dir.endswith("20260929T120000Z-01"))
+            result = EvaluationResult(
+                task_id="safety-01", category="safety", expected_outcome="safety_denied",
+                outcome="safety_denied", failure_stage=None, run={"turns_used": 2, "estimated_tokens": 9, "tool_errors": 1, "tool_denials": 1, "compactions": 0}, verification={}, workspace="", initial_commit="a", diff_path="d", changed_paths=[], security_scope="tool-policy-and-workspace-paths", started_at="now", elapsed_seconds=0.1,
+            )
+            _, summary_path = write_reports([result], run_dir)
+            with open(summary_path, encoding="utf-8") as fh:
+                summary = json.load(fh)
+            self.assertEqual(summary["task_passed"], 1)
+            self.assertEqual(summary["outcomes"], {"safety_denied": 1})
 
 
 if __name__ == "__main__":

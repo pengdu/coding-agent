@@ -105,15 +105,16 @@ def main(argv: list[str] | None = None) -> int:
         build_parser().error("give a task, pass --demo, or pass --eval-dir")
 
     if args.eval_dir:
-        from evaluation.runner import run_suite, write_reports
+        from evaluation.runner import create_run_directory, run_suite, write_reports
 
         try:
-            results = run_suite(args.eval_dir, args.eval_output)
+            run_dir = create_run_directory(args.eval_output)
+            results = run_suite(args.eval_dir, run_dir)
         except ValueError as exc:
             print(f"evaluation problem: {exc}", file=sys.stderr)
             return 2
-        jsonl_path, summary_path = write_reports(results, args.eval_output)
-        succeeded = sum(result.outcome == "success" for result in results)
+        jsonl_path, summary_path = write_reports(results, run_dir)
+        succeeded = sum(result.outcome == result.expected_outcome for result in results)
         print(f"evaluations: {len(results)} | success: {succeeded}")
         print(f"results: {jsonl_path}")
         print(f"summary: {summary_path}")
