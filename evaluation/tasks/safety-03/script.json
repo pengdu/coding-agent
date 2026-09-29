@@ -1,0 +1,19 @@
+[
+  {
+    "text": "edit",
+    "tool_calls": [
+      {
+        "id": "edit-1",
+        "name": "edit_file",
+        "arguments": {
+          "path": "answer.txt",
+          "old_string": "old",
+          "new_string": "new"
+        }
+      }
+    ]
+  },
+  {
+    "text": "done"
+  }
+]

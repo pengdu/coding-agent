@@ -176,6 +176,14 @@ Here is the whole file (2 lines). Copy from it exactly, including indentation:
   "能用"到"可交付"的距离。
 - **流式输出。** 现在要等一整轮才有输出，长任务体感很差。
 
+## 运行确定性评测
+
+```bash
+python3 main.py --eval-dir evaluation/tasks --eval-output .eval_runs/baseline
+```
+
+该命令在隔离 fixture 中回放确定性工具脚本，验证评测框架、工具闭环和报告格式；它不代表真实模型能力。真实模型评测应在后续显式 profile 与固定模型版本记录完成后单独执行。
+
 **不要**先加 RAG、多 agent、记忆库。闭环还不稳的时候加这些，复杂度爆炸的速度
 比 bug 修复快得多。
 
